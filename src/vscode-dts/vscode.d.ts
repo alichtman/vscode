@@ -11062,6 +11062,84 @@ declare module 'vscode' {
 	}
 
 	/**
+	 * Policy for URI handlers on platforms where CSRF protection cannot be enforced.
+	 */
+	export enum UriHandlerUnsupportedPlatformPolicy {
+		/** Reject every non-exempt URI. */
+		Reject = 'reject',
+		/** Dispatch non-exempt URIs without verification. */
+		Allow = 'allow'
+	}
+
+	/**
+	 * Options for CSRF protection of a {@link UriHandler}. See {@link UriHandlerOptions.csrfProtection}.
+	 */
+	export interface UriHandlerCsrfProtectionOptions {
+		/**
+		 * Absolute path to the file holding the shared secret used to sign incoming uris.
+		 *
+		 * When omitted, a derivable default location under the extension's global storage is used so a
+		 * cooperating local tool can use `code --sign-extension-uri` without configuration. Provide this
+		 * only when deployment policy requires the secret at a fixed path.
+		 * Invalid, relative, or non-file uris are ignored and the default location is used.
+		 *
+		 * Regardless of location, the editor or `code --sign-extension-uri` creates the file if absent
+		 * (atomically, owner-only), fills it with high-entropy random contents, and **refuses to trust it
+		 * if it is world-readable or -writable** (group access is allowed, e.g. for a companion daemon in
+		 * the same group). The path
+		 * resolves on the machine where the handler runs (the remote host for a remote extension), which
+		 * is the same machine the signing tool runs on.
+		 */
+		readonly secretFile?: Uri;
+
+		/**
+		 * Uri {@link Uri.path paths} that are exempt from CSRF protection: incoming uris whose path
+		 * matches one of these (exactly, case-sensitively) are dispatched **without** requiring a token.
+		 * Every other path requires a valid token.
+		 *
+		 * This is necessary for legitimately web-initiated routes that a browser cannot sign — most
+		 * importantly authentication callbacks ({@link env.asExternalUri} → {@link env.openExternal} →
+		 * browser redirect back to the handler). Such a path must be exempted or it would be blocked.
+		 */
+		readonly unprotectedPaths?: readonly string[];
+
+		/**
+		 * Required policy for environments where CSRF cannot be enforced — a web extension host (no
+		 * local secret a remote page cannot also reach), or Windows (enforcement is not yet implemented).
+		 * `reject` blocks every non-{@link unprotectedPaths exempt} uri. `allow` dispatches those uris
+		 * without verification.
+		 */
+		readonly unsupportedPlatforms: UriHandlerUnsupportedPlatformPolicy;
+	}
+
+	/**
+	 * Options for {@link window.registerUriHandler}.
+	 */
+	export interface UriHandlerOptions {
+		/**
+		 * Require every incoming uri to carry a valid CSRF token before it reaches
+		 * {@link UriHandler.handleUri}. This proves the uri was created by a local process (which can
+		 * read the shared secret) rather than a remote web page (which cannot), mitigating cross-site
+		 * request forgery against the handler.
+		 *
+		 * The options must explicitly choose how unsupported platforms behave. They may also override
+		 * the secret location or exempt specific routes (for example, authentication callbacks).
+		 *
+		 * A missing, invalid, or expired token causes the uri to be rejected — the handler is not
+		 * invoked and the user is notified. The reserved `vscode-csrf-token` query parameter carries the
+		 * signature and `vscode-csrf-ts` the signing time; both are stripped before
+		 * {@link UriHandler.handleUri} is called, including for exempt routes and when unsupported
+		 * platforms use the `allow` policy.
+		 * Signed links expire a few hours after they are created, and timestamps too far in the future are
+		 * rejected.
+		 *
+		 * This can also be declared in `package.json` via `contributes.uriHandler.csrfProtection`, which
+		 * is the recommended, statically-auditable form and takes precedence over this option.
+		 */
+		readonly csrfProtection?: UriHandlerCsrfProtectionOptions;
+	}
+
+	/**
 	 * Namespace for dealing with the current window of the editor. That is visible
 	 * and active editors, as well as, UI elements to show messages, selections, and
 	 * asking for user input.
@@ -11719,9 +11797,14 @@ declare module 'vscode' {
 		 * the current extension is about to be handled.
 		 *
 		 * @param handler The uri handler to register for this extension.
+		 * @param options Options controlling how incoming uris are handled, e.g. CSRF protection.
+		 *
+		 * The `vscode-csrf-token` and `vscode-csrf-ts` query parameters are reserved by the editor and
+		 * are always removed before {@link UriHandler.handleUri} is called, whether or not protection is
+		 * enabled.
 		 * @returns A {@link Disposable disposable} that unregisters the handler.
 		 */
-		export function registerUriHandler(handler: UriHandler): Disposable;
+		export function registerUriHandler(handler: UriHandler, options?: UriHandlerOptions): Disposable;
 
 		/**
 		 * Registers a webview panel serializer.

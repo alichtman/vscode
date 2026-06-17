@@ -11,6 +11,7 @@ import { onUnexpectedError } from '../../../base/common/errors.js';
 import { ExtensionIdentifierSet, IExtensionDescription } from '../../../platform/extensions/common/extensions.js';
 import { createDecorator } from '../../../platform/instantiation/common/instantiation.js';
 import { IExtHostRpcService } from './extHostRpcService.js';
+import { IExtHostUriHandlerCsrf } from './extHostUriHandlerCsrf.js';
 
 export class ExtHostUrls implements ExtHostUrlsShape {
 
@@ -20,15 +21,16 @@ export class ExtHostUrls implements ExtHostUrlsShape {
 	private readonly _proxy: MainThreadUrlsShape;
 
 	private handles = new ExtensionIdentifierSet();
-	private handlers = new Map<number, vscode.UriHandler>();
+	private handlers = new Map<number, { readonly handler: vscode.UriHandler; readonly extension: IExtensionDescription }>();
 
 	constructor(
-		@IExtHostRpcService extHostRpc: IExtHostRpcService
+		@IExtHostRpcService extHostRpc: IExtHostRpcService,
+		@IExtHostUriHandlerCsrf private readonly csrf: IExtHostUriHandlerCsrf,
 	) {
 		this._proxy = extHostRpc.getProxy(MainContext.MainThreadUrls);
 	}
 
-	registerUriHandler(extension: IExtensionDescription, handler: vscode.UriHandler): vscode.Disposable {
+	registerUriHandler(extension: IExtensionDescription, handler: vscode.UriHandler, options?: vscode.UriHandlerOptions): vscode.Disposable {
 		const extensionId = extension.identifier;
 		if (this.handles.has(extensionId)) {
 			throw new Error(`Protocol handler already registered for extension ${extensionId}`);
@@ -36,29 +38,35 @@ export class ExtHostUrls implements ExtHostUrlsShape {
 
 		const handle = ExtHostUrls.HandlePool++;
 		this.handles.add(extensionId);
-		this.handlers.set(handle, handler);
+		this.handlers.set(handle, { handler, extension });
+		const csrfDisposable = this.csrf.initialize(extension, options);
 		this._proxy.$registerUriHandler(handle, extensionId, extension.displayName || extension.name);
 
 		return toDisposable(() => {
 			this.handles.delete(extensionId);
 			this.handlers.delete(handle);
+			csrfDisposable.dispose();
 			this._proxy.$unregisterUriHandler(handle);
 		});
 	}
 
-	$handleExternalUri(handle: number, uri: UriComponents): Promise<void> {
-		const handler = this.handlers.get(handle);
-
-		if (!handler) {
-			return Promise.resolve(undefined);
+	async $handleExternalUri(handle: number, uri: UriComponents): Promise<void> {
+		const entry = this.handlers.get(handle);
+		if (!entry) {
+			return;
 		}
+
+		const decision = await this.csrf.handle(entry.extension, URI.revive(uri));
+		if (decision.kind === 'reject') {
+			this._proxy.$notifyCsrfDeeplinkRejection(entry.extension.identifier, entry.extension.displayName || entry.extension.name);
+			return;
+		}
+
 		try {
-			handler.handleUri(URI.revive(uri));
+			entry.handler.handleUri(decision.uri);
 		} catch (err) {
 			onUnexpectedError(err);
 		}
-
-		return Promise.resolve(undefined);
 	}
 
 	async createAppUri(uri: URI): Promise<vscode.Uri> {

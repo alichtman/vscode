@@ -105,6 +105,7 @@ export interface NativeParsedArgs {
 	'update-extensions'?: boolean;
 	'do-not-include-pack-dependencies'?: boolean;
 	'locate-extension'?: string[]; // undefined or array of 1 or more
+	'sign-extension-uri'?: string;
 	'enable-proposed-api'?: string[]; // undefined or array of 1 or more
 	'open-url'?: boolean;
 	'skip-release-notes'?: boolean;

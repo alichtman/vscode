@@ -1860,6 +1860,7 @@ export interface MainThreadUrlsShape extends IDisposable {
 	$registerUriHandler(handle: number, extensionId: ExtensionIdentifier, extensionDisplayName: string): Promise<void>;
 	$unregisterUriHandler(handle: number): Promise<void>;
 	$createAppUri(uri: UriComponents): Promise<UriComponents>;
+	$notifyCsrfDeeplinkRejection(extensionId: ExtensionIdentifier, extensionDisplayName: string): Promise<void>;
 }
 
 export interface IChatResponseProgressFileTreeData {

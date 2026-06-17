@@ -33,6 +33,7 @@ import { IConfigurationService } from '../../platform/configuration/common/confi
 import { ILogService } from '../../platform/log/common/log.js';
 import { promiseWithResolvers } from '../../base/common/async.js';
 import { shouldUseEnvironmentVariableCollection } from '../../platform/terminal/common/terminalEnvironment.js';
+import { signInstalledExtensionUri } from '../../platform/uriHandler/node/uriHandlerCsrf.js';
 
 class CustomVariableResolver extends AbstractVariableResolverService {
 	constructor(
@@ -267,7 +268,11 @@ export class RemoteTerminalChannel extends Disposable implements IServerChannel<
 		const commandsExecuter: ICommandsExecuter = {
 			executeCommand: <T>(id: string, ...args: unknown[]): Promise<T> => this._executeCommand(persistentProcessId, id, args, uriTransformer)
 		};
-		const cliServer = new CLIServerBase(commandsExecuter, this._logService, ipcHandlePath);
+		const cliServer = new CLIServerBase(commandsExecuter, this._logService, ipcHandlePath, async uri => {
+			const extensions = await this._extensionManagementService.getInstalled();
+			const globalStorageHome = URI.joinPath(this._environmentService.userRoamingDataHome, 'globalStorage');
+			return signInstalledExtensionUri(uri, this._productService.urlProtocol, extensions, globalStorageHome, this._logService);
+		});
 		this._ptyHostService.onProcessExit(e => e.id === persistentProcessId && cliServer.dispose());
 
 		return {

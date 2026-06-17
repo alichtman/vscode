@@ -77,6 +77,7 @@ import { AllowedMcpServersService } from '../../platform/mcp/common/allowedMcpSe
 import { IMcpGalleryManifestService } from '../../platform/mcp/common/mcpGalleryManifest.js';
 import { McpGalleryManifestService } from '../../platform/mcp/common/mcpGalleryManifestService.js';
 import { LINUX_SYSTEM_POLICY_FILE_PATH } from '../../base/common/policy.js';
+import { signInstalledExtensionUri } from '../../platform/uriHandler/node/uriHandlerCsrf.js';
 
 class CliMain extends Disposable {
 
@@ -335,6 +336,16 @@ class CliMain extends Disposable {
 		// Locate Extension
 		else if (this.argv['locate-extension']) {
 			return instantiationService.createInstance(ExtensionManagementCLI, [], new ConsoleLogger(LogLevel.Info, false)).locateExtension(this.argv['locate-extension']);
+		}
+
+		// Sign extension URI
+		else if (this.argv['sign-extension-uri']) {
+			const extensionManagementService = instantiationService.invokeFunction(accessor => accessor.get(INativeServerExtensionManagementService));
+			const extensions = await extensionManagementService.getInstalled(undefined, profileLocation);
+			const logService = instantiationService.invokeFunction(accessor => accessor.get(ILogService));
+			const globalStorageHome = (profile ?? userDataProfilesService.defaultProfile).globalStorageHome.with({ scheme: Schemas.file });
+			console.log(await signInstalledExtensionUri(this.argv['sign-extension-uri'], product.urlProtocol, extensions, globalStorageHome, logService));
+			return;
 		}
 
 		// Install MCP server

@@ -11,6 +11,9 @@ import { Disposable, IDisposable } from '../../../base/common/lifecycle.js';
 import { IExtensionContributedURLHandler, IExtensionUrlHandler } from '../../services/extensions/browser/extensionUrlHandler.js';
 import { ExtensionIdentifier } from '../../../platform/extensions/common/extensions.js';
 import { ITrustedDomainService } from '../../contrib/url/browser/trustedDomainService.js';
+import { INotificationService, Severity } from '../../../platform/notification/common/notification.js';
+import { ICommandService } from '../../../platform/commands/common/commands.js';
+import { localize } from '../../../nls.js';
 
 class ExtensionUrlHandler implements IExtensionContributedURLHandler {
 
@@ -41,7 +44,9 @@ export class MainThreadUrls extends Disposable implements MainThreadUrlsShape {
 		context: IExtHostContext,
 		@ITrustedDomainService trustedDomainService: ITrustedDomainService,
 		@IURLService private readonly urlService: IURLService,
-		@IExtensionUrlHandler private readonly extensionUrlHandler: IExtensionUrlHandler
+		@IExtensionUrlHandler private readonly extensionUrlHandler: IExtensionUrlHandler,
+		@INotificationService private readonly notificationService: INotificationService,
+		@ICommandService private readonly commandService: ICommandService,
 	) {
 		super();
 
@@ -76,6 +81,15 @@ export class MainThreadUrls extends Disposable implements MainThreadUrlsShape {
 
 	async $createAppUri(uri: UriComponents): Promise<URI> {
 		return this.urlService.create(uri);
+	}
+
+	async $notifyCsrfDeeplinkRejection(extensionId: ExtensionIdentifier, extensionDisplayName: string): Promise<void> {
+		const message = localize('csrfRejected', "VS Code blocked an unauthenticated link to the '{0}' extension. The link was not signed by a trusted local source.", extensionDisplayName);
+
+		this.notificationService.prompt(Severity.Warning, message, [{
+			label: localize('showLogs', "Show Logs"),
+			run: () => this.commandService.executeCommand('workbench.action.showLogs')
+		}]);
 	}
 
 	override dispose(): void {

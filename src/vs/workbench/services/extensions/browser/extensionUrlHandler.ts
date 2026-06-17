@@ -13,6 +13,7 @@ import { IStorageService, StorageScope, StorageTarget } from '../../../../platfo
 import { IURLHandler, IURLService, IOpenURLOptions } from '../../../../platform/url/common/url.js';
 import { IHostService } from '../../host/browser/host.js';
 import { ActivationKind, IExtensionService } from '../common/extensions.js';
+import { stripCsrfToken } from '../../../../platform/uriHandler/common/uriHandlerCsrf.js';
 import { ExtensionIdentifier } from '../../../../platform/extensions/common/extensions.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
 import { IWorkbenchContribution, WorkbenchPhase, registerWorkbenchContribution2 } from '../../../common/contributions.js';
@@ -175,9 +176,8 @@ class ExtensionUrlHandler implements IExtensionUrlHandler, IURLHandler {
 			if (!extension) {
 				await this.handleUnhandledURL(uri, extensionId, options);
 				return true;
-			} else {
-				extensionDisplayName = extension.displayName ?? '';
 			}
+			extensionDisplayName = extension.displayName ?? '';
 		} else {
 			extensionDisplayName = initialHandler.extensionDisplayName;
 		}
@@ -187,7 +187,8 @@ class ExtensionUrlHandler implements IExtensionUrlHandler, IURLHandler {
 			|| this.didUserTrustExtension(ExtensionIdentifier.toKey(extensionId));
 
 		if (!trusted) {
-			const uriString = uri.toString(false);
+			// don't print invalid csrf token in the toast
+			const uriString = stripCsrfToken(uri).toString(false);
 			let uriLabel = uriString;
 
 			if (uriLabel.length > 40) {
