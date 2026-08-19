@@ -48,7 +48,7 @@ suite('URI handler CSRF CLI signer', () => {
 		const secretFile = URI.file(join(dir, 'test.ext', 'uri-csrf.secret'));
 		const secret = await new CsrfSecretStore(logService).getSecret(secretFile);
 		assert.ok(secret);
-		assert.deepStrictEqual(await verifyCsrfToken(secret, signed.path, signed.query, Date.now(), signed.fragment), { ok: true });
+		assert.deepStrictEqual(await verifyCsrfToken(secret, signed.authority, signed.path, signed.query, Date.now(), signed.fragment), { ok: true });
 	});
 
 	test('rejects an extension without an explicit unsupported-platform policy', async () => {

@@ -74,7 +74,7 @@ suite('ExtHostUrls CSRF dispatch (integration)', () => {
 	async function signedUri(path: string, params: Record<string, string>, ts: number = Date.now()): Promise<URI> {
 		const all: Record<string, string> = { ...params, [CSRF_TS_PARAM]: String(ts) };
 		const base = Object.entries(all).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
-		const token = await computeToken(secret, path, base);
+		const token = await computeToken(secret, 'test.ext', path, base);
 		return URI.parse(`vscode://test.ext${path}?${base}&${CSRF_TOKEN_PARAM}=${token}`);
 	}
 
@@ -95,6 +95,15 @@ suite('ExtHostUrls CSRF dispatch (integration)', () => {
 		await extHostUrls.$handleExternalUri(handle, uri.toJSON());
 
 		assert.strictEqual(received, undefined, 'a forged link must not reach the handler');
+		assert.deepStrictEqual(rejections, ['Test Ext']);
+	});
+
+	test('a link cannot be moved to another extension even when the secret is shared', async () => {
+		register({ unsupportedPlatforms: 'reject' });
+		const uri = (await signedUri('/start', { program: '/bin/sh' })).with({ authority: 'other.ext' });
+		await extHostUrls.$handleExternalUri(handle, uri.toJSON());
+
+		assert.strictEqual(received, undefined);
 		assert.deepStrictEqual(rejections, ['Test Ext']);
 	});
 

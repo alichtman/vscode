@@ -53,11 +53,14 @@ export function resolveUriHandlerCsrfManifest(uriHandlerValue: unknown): IResolv
 		&& (!Array.isArray(manifest.unprotectedPaths) || !manifest.unprotectedPaths.every(isString));
 	const hasInvalidUnsupportedPlatforms = manifest.unsupportedPlatforms !== 'allow' && manifest.unsupportedPlatforms !== 'reject';
 	const malformed = hasUnknownProperty || hasInvalidSecretFile || hasInvalidUnprotectedPaths || hasInvalidUnsupportedPlatforms;
+	if (malformed) {
+		return malformedManifestPolicy();
+	}
 	return {
 		secretFileSpec: isString(manifest.secretFile) ? manifest.secretFile : undefined,
 		unprotectedPaths: new Set(Array.isArray(manifest.unprotectedPaths) && manifest.unprotectedPaths.every(isString) ? manifest.unprotectedPaths : []),
-		unsupportedPlatforms: manifest.unsupportedPlatforms === 'allow' && !malformed ? 'allow' : 'reject',
-		malformed,
+		unsupportedPlatforms: manifest.unsupportedPlatforms === 'allow' ? 'allow' : 'reject',
+		malformed: false,
 	};
 }
 
@@ -97,13 +100,13 @@ function safeDecode(value: string): string {
 
 /**
  * Canonical form shared by the CLI signer and extension-host verifier. It binds the token to the
- * URI path, fragment, and every non-reserved query parameter while normalizing query ordering and
- * percent encoding.
+ * normalized extension authority, URI path, fragment, and every non-reserved query parameter while
+ * normalizing query ordering and percent encoding.
  */
-export function canonicalize(path: string, query: string, fragment: string = ''): string {
+export function canonicalize(authority: string, path: string, query: string, fragment: string = ''): string {
 	const params = parseQuery(query).filter(p => p.key !== CSRF_TOKEN_PARAM);
 	params.sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : a.value < b.value ? -1 : a.value > b.value ? 1 : 0);
-	return [encodeURIComponent(path), encodeURIComponent(fragment), ...params.map(p => `${encodeURIComponent(p.key)}=${encodeURIComponent(p.value)}`)].join('\n');
+	return [encodeURIComponent(authority.toLowerCase()), encodeURIComponent(path), encodeURIComponent(fragment), ...params.map(p => `${encodeURIComponent(p.key)}=${encodeURIComponent(p.value)}`)].join('\n');
 }
 
 function extractParam(query: string, key: string): string | undefined {
@@ -143,9 +146,9 @@ function toHex(bytes: Uint8Array): string {
 	return out;
 }
 
-export async function computeToken(secret: Uint8Array, path: string, query: string, fragment: string = ''): Promise<string> {
+export async function computeToken(secret: Uint8Array, authority: string, path: string, query: string, fragment: string = ''): Promise<string> {
 	const key = await crypto.subtle.importKey('raw', secret as unknown as ArrayBufferView<ArrayBuffer>, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-	const message = new TextEncoder().encode(canonicalize(path, query, fragment));
+	const message = new TextEncoder().encode(canonicalize(authority, path, query, fragment));
 	const signature = await crypto.subtle.sign('HMAC', key, message as unknown as ArrayBufferView<ArrayBuffer>);
 	return toHex(new Uint8Array(signature));
 }
@@ -170,7 +173,7 @@ export const enum CsrfRejectionReason {
 
 export type CsrfVerifyResult = { readonly ok: true } | { readonly ok: false; readonly reason: CsrfRejectionReason };
 
-export async function verifyCsrfToken(secret: Uint8Array | undefined, path: string, query: string, now: number, fragment: string = ''): Promise<CsrfVerifyResult> {
+export async function verifyCsrfToken(secret: Uint8Array | undefined, authority: string, path: string, query: string, now: number, fragment: string = ''): Promise<CsrfVerifyResult> {
 	const claimed = extractToken(query);
 	if (claimed === undefined) {
 		return { ok: false, reason: CsrfRejectionReason.Missing };
@@ -178,7 +181,7 @@ export async function verifyCsrfToken(secret: Uint8Array | undefined, path: stri
 	if (!secret) {
 		return { ok: false, reason: CsrfRejectionReason.NoSecret };
 	}
-	const expected = await computeToken(secret, path, query, fragment);
+	const expected = await computeToken(secret, authority, path, query, fragment);
 	if (!timingSafeEqual(expected, claimed)) {
 		return { ok: false, reason: CsrfRejectionReason.InvalidSignature };
 	}
@@ -194,6 +197,6 @@ export async function signUri(secret: Uint8Array, uri: URI, now: number = Date.n
 	const unsigned = stripCsrfToken(uri);
 	const timestamp = `${encodeURIComponent(CSRF_TS_PARAM)}=${now}`;
 	const query = unsigned.query ? `${unsigned.query}&${timestamp}` : timestamp;
-	const token = await computeToken(secret, unsigned.path, query, unsigned.fragment);
+	const token = await computeToken(secret, unsigned.authority, unsigned.path, query, unsigned.fragment);
 	return unsigned.with({ query: `${query}&${encodeURIComponent(CSRF_TOKEN_PARAM)}=${token}` });
 }

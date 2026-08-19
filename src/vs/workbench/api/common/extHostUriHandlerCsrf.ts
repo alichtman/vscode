@@ -79,10 +79,13 @@ export function resolveUriHandlerCsrf(extension: IExtensionDescription, options?
 		|| (option.secretFile !== undefined && !URI.isUri(option.secretFile))
 		|| (option.unprotectedPaths !== undefined && (!Array.isArray(option.unprotectedPaths) || !option.unprotectedPaths.every(isString)))
 		|| (option.unsupportedPlatforms !== 'allow' && option.unsupportedPlatforms !== 'reject');
+	if (malformed) {
+		return { unprotectedPaths: new Set(), unsupportedPlatforms: 'reject' };
+	}
 	return {
 		secretFile: URI.isUri(option.secretFile) ? option.secretFile : undefined,
-		unprotectedPaths: new Set(!malformed && Array.isArray(option.unprotectedPaths) && option.unprotectedPaths.every(isString) ? option.unprotectedPaths : []),
-		unsupportedPlatforms: option.unsupportedPlatforms === 'allow' && !malformed ? 'allow' : 'reject',
+		unprotectedPaths: new Set(Array.isArray(option.unprotectedPaths) && option.unprotectedPaths.every(isString) ? option.unprotectedPaths : []),
+		unsupportedPlatforms: option.unsupportedPlatforms === 'allow' ? 'allow' : 'reject',
 	};
 }
 

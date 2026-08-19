@@ -45,6 +45,54 @@ suite('CsrfSecretStore (integration)', () => {
 		}
 	});
 
+	test('concurrent creators all observe the same atomically-installed secret', async () => {
+		const file = secretUri();
+		const secrets = await Promise.all(Array.from({ length: 16 }, () => store.getSecret(file)));
+		assert.ok(secrets.every(secret => secret !== undefined));
+		assert.ok(secrets.every(secret => Buffer.from(secret!).equals(Buffer.from(secrets[0]!))));
+	});
+
+	test('does not overwrite an existing malformed secret file', async () => {
+		const file = secretUri();
+		await fs.writeFile(file.fsPath, '{ malformed', { mode: 0o600 });
+
+		assert.strictEqual(await store.getSecret(file), undefined);
+		assert.strictEqual(await fs.readFile(file.fsPath, 'utf8'), '{ malformed');
+	});
+
+	test('rejects a non-regular secret path', async () => {
+		const file = secretUri();
+		await fs.mkdir(file.fsPath);
+		assert.strictEqual(await store.getSecret(file), undefined);
+	});
+
+	(isWindows ? test.skip : test)('rejects a symbolic-link secret without following it', async () => {
+		const target = secretUri('target.secret');
+		const file = secretUri();
+		await fs.writeFile(target.fsPath, 'known contents', { mode: 0o600 });
+		await fs.symlink(target.fsPath, file.fsPath);
+
+		assert.strictEqual(await store.getSecret(file), undefined);
+		assert.strictEqual(await fs.readFile(target.fsPath, 'utf8'), 'known contents');
+	});
+
+	(isWindows ? test.skip : test)('rejects a symbolic-link secret directory', async () => {
+		const realDirectory = join(dir, 'real');
+		const linkedDirectory = join(dir, 'linked');
+		await fs.mkdir(realDirectory, { mode: 0o700 });
+		await fs.symlink(realDirectory, linkedDirectory);
+
+		assert.strictEqual(await store.getSecret(URI.file(join(linkedDirectory, 'uri-csrf.secret'))), undefined);
+	});
+
+	(isWindows ? test.skip : test)('rejects a secret under a non-sticky world-writable directory', async () => {
+		const unsafeDirectory = join(dir, 'unsafe');
+		await fs.mkdir(unsafeDirectory, { mode: 0o700 });
+		await fs.chmod(unsafeDirectory, 0o777);
+
+		assert.strictEqual(await store.getSecret(URI.file(join(unsafeDirectory, 'uri-csrf.secret'))), undefined);
+	});
+
 	async function ageSecret(file: URI): Promise<void> {
 		const parsed = JSON.parse(await fs.readFile(file.fsPath, 'utf8'));
 		parsed.createdAt = Date.now() - 25 * 60 * 60 * 1000;
@@ -66,6 +114,19 @@ suite('CsrfSecretStore (integration)', () => {
 		await store.rotateIfStale(file);
 		const second = await store.getSecret(file);
 		assert.notDeepStrictEqual(Array.from(second!), Array.from(first!), 'a stale secret must be rotated');
+	});
+
+	test('concurrent rotation keeps one coherent current/previous key pair', async () => {
+		const file = secretUri();
+		const first = await store.getSecret(file);
+		await ageSecret(file);
+
+		await Promise.all(Array.from({ length: 8 }, () => store.rotateIfStale(file)));
+
+		const current = await store.getSecret(file);
+		const previous = await store.getPreviousSecret(file);
+		assert.notDeepStrictEqual(Array.from(current!), Array.from(first!));
+		assert.deepStrictEqual(Array.from(previous!), Array.from(first!));
 	});
 
 	test('rotateIfStale leaves a fresh secret unchanged', async () => {
@@ -100,12 +161,12 @@ suite('CsrfSecretStore (integration)', () => {
 		const now = 1_700_000_000_000;
 		const base = `program=%2Fbin%2Fsh&request=launch&${CSRF_TS_PARAM}=${now}`;
 
-		const token = await computeToken(secret, path, base);
+		const token = await computeToken(secret, 'test.ext', path, base);
 		const signed = `${base}&${CSRF_TOKEN_PARAM}=${token}`;
-		assert.deepStrictEqual(await verifyCsrfToken(secret, path, signed, now), { ok: true });
+		assert.deepStrictEqual(await verifyCsrfToken(secret, 'test.ext', path, signed, now), { ok: true });
 
 		const tampered = `program=%2Fbin%2Fevil&request=launch&${CSRF_TS_PARAM}=${now}&${CSRF_TOKEN_PARAM}=${token}`;
-		assert.strictEqual((await verifyCsrfToken(secret, path, tampered, now)).ok, false);
+		assert.strictEqual((await verifyCsrfToken(secret, 'test.ext', path, tampered, now)).ok, false);
 	});
 
 	(isWindows ? test.skip : test)('rejects a world-writable secret (POSIX)', async () => {

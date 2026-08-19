@@ -34,7 +34,7 @@ const params = Object.fromEntries(kv.map(s => { const i = s.indexOf('='); return
 const secret = Buffer.from(JSON.parse(readFileSync(secretFile, 'utf8')).secret, 'base64');
 const signed = Object.assign({}, params, { 'vscode-csrf-ts': String(Date.now()) });
 const sorted = Object.entries(signed).sort(([ak, av], [bk, bv]) => ak < bk ? -1 : ak > bk ? 1 : av < bv ? -1 : av > bv ? 1 : 0);
-	const canonical = [encodeURIComponent(uriPath), '']
+const canonical = [encodeURIComponent(extensionId.toLowerCase()), encodeURIComponent(uriPath), '']
 	.concat(sorted.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)))
 	.join('\\n');
 const token = createHmac('sha256', secret).update(canonical).digest('hex');
@@ -102,7 +102,9 @@ suite('ExtHostUrls CSRF — external CLI signer interop', () => {
 
 	/** Generate a deeplink by running the standalone signer in its own `node` process. */
 	async function signWithExternalCli(secretFile: string, uriPath: string, ...params: string[]): Promise<string> {
-		const { stdout } = await execFileAsync(process.execPath, [signerPath, secretFile, 'test.ext', uriPath, ...params]);
+		const { stdout } = await execFileAsync(process.execPath, [signerPath, secretFile, 'test.ext', uriPath, ...params], {
+			env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+		});
 		return stdout.trim();
 	}
 

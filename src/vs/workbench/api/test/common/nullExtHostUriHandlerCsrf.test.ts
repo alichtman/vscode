@@ -42,6 +42,30 @@ suite('NullExtHostUriHandlerCsrf / resolveUriHandlerCsrf', () => {
 		assert.strictEqual(resolved.unsupportedPlatforms, 'reject', 'malformed security policy must reject');
 	});
 
+	test('resolver: one malformed manifest field discards every otherwise-valid weakening option', () => {
+		const resolved = resolveUriHandlerCsrf(extension({
+			secretFile: '/tmp/shared.secret',
+			unprotectedPaths: ['/sensitive'],
+			unsupportedPlatform: 'allow',
+		}))!;
+		assert.strictEqual(resolved.secretFileSpec, undefined);
+		assert.deepStrictEqual([...resolved.unprotectedPaths], []);
+		assert.strictEqual(resolved.unsupportedPlatforms, 'reject');
+	});
+
+	test('resolver: one malformed runtime field discards every otherwise-valid weakening option', () => {
+		const resolved = resolveUriHandlerCsrf(extension(undefined), {
+			csrfProtection: {
+				secretFile: URI.file('/tmp/shared.secret'),
+				unprotectedPaths: ['/sensitive'],
+				unsupportedPlatforms: 'invalid',
+			} as never,
+		})!;
+		assert.strictEqual(resolved.secretFile, undefined);
+		assert.deepStrictEqual([...resolved.unprotectedPaths], []);
+		assert.strictEqual(resolved.unsupportedPlatforms, 'reject');
+	});
+
 	test('resolver: unknown manifest properties fail closed', () => {
 		const resolved = resolveUriHandlerCsrf(extension({ unsupportedPlatform: 'allow' }))!;
 		assert.strictEqual(resolved.unsupportedPlatforms, 'reject', 'a typo must not silently allow unverified dispatch');
