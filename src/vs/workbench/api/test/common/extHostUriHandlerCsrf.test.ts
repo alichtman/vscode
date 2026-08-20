@@ -29,19 +29,19 @@ suite('ExtHostUriHandlerCsrf', () => {
 	const PATH = '/start';
 	const NOW = 1_700_000_000_000;
 
+	/** Sign an exact query serialization; the timestamp is expected to be part of it already. */
+	async function signQuery(path: string, base: string): Promise<string> {
+		return `${base}&${CSRF_TOKEN_PARAM}=${await computeToken(secret, AUTHORITY, path, base)}`;
+	}
+
 	/** Build the query string a legitimate signer would produce (timestamp included in the signed message). */
 	async function sign(path: string, params: Record<string, string>, ts: number = NOW): Promise<string> {
 		const all: Record<string, string> = { ...params, [CSRF_TS_PARAM]: String(ts) };
-		const base = Object.entries(all).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
-		const token = await computeToken(secret, AUTHORITY, path, base);
-		return `${base}&${CSRF_TOKEN_PARAM}=${token}`;
+		return signQuery(path, Object.entries(all).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&'));
 	}
 
-	test('canonicalize binds the path, is order/encoding-independent, and excludes the token', () => {
-		const a = canonicalize(AUTHORITY, '/start', 'program=%2Fbin%2Fsh&request=launch');
-		const b = canonicalize(AUTHORITY, '/start', 'request=launch&program=/bin/sh');
-		assert.strictEqual(a, b);
-		assert.strictEqual(a, 'test.ext\n%2Fstart\n\nprogram=%2Fbin%2Fsh\nrequest=launch');
+	test('canonicalize binds the authority and path, and excludes the token', () => {
+		assert.strictEqual(canonicalize(AUTHORITY, '/start', 'a=1&b=2'), 'test.ext\n%2Fstart\n\na%3D1%26b%3D2');
 
 		// Different routes produce different canonical messages even with identical params.
 		assert.notStrictEqual(canonicalize(AUTHORITY, '/start', 'program=/bin/sh'), canonicalize(AUTHORITY, '/run', 'program=/bin/sh'));
@@ -51,7 +51,17 @@ suite('ExtHostUriHandlerCsrf', () => {
 		assert.strictEqual(canonicalize('TEST.EXT', '/start', 'program=/bin/sh'), canonicalize(AUTHORITY, '/start', 'program=/bin/sh'));
 
 		// The reserved token param must never participate in the signed message.
-		assert.strictEqual(canonicalize(AUTHORITY, '/start', `program=/bin/sh&${CSRF_TOKEN_PARAM}=deadbeef`), 'test.ext\n%2Fstart\n\nprogram=%2Fbin%2Fsh');
+		assert.strictEqual(canonicalize(AUTHORITY, '/start', `program=/bin/sh&${CSRF_TOKEN_PARAM}=deadbeef`), canonicalize(AUTHORITY, '/start', 'program=/bin/sh'));
+	});
+
+	test('canonicalize binds the exact query serialization the handler will see', () => {
+		// The query reaches `handleUri` verbatim, so every difference an extension could observe has to
+		// change the signed message: parameter order, which of two duplicates came first, the spelling
+		// of an empty value, and percent-encoding.
+		assert.notStrictEqual(canonicalize(AUTHORITY, PATH, 'a=1&b=2'), canonicalize(AUTHORITY, PATH, 'b=2&a=1'));
+		assert.notStrictEqual(canonicalize(AUTHORITY, PATH, 'a=1&a=2'), canonicalize(AUTHORITY, PATH, 'a=2&a=1'));
+		assert.notStrictEqual(canonicalize(AUTHORITY, PATH, 'a'), canonicalize(AUTHORITY, PATH, 'a='));
+		assert.notStrictEqual(canonicalize(AUTHORITY, PATH, 'program=%2Fbin%2Fsh'), canonicalize(AUTHORITY, PATH, 'program=/bin/sh'));
 	});
 
 	test('serialization is injective: a value with delimiters cannot mimic separate params', () => {
@@ -90,6 +100,28 @@ suite('ExtHostUriHandlerCsrf', () => {
 		const tampered = `program=${encodeURIComponent('/bin/evil')}&request=launch&${CSRF_TS_PARAM}=${NOW}&${CSRF_TOKEN_PARAM}=${token}`;
 		const result = await verifyCsrfToken(secret, AUTHORITY, PATH, tampered, NOW);
 		assert.deepStrictEqual(result, { ok: false, reason: CsrfRejectionReason.InvalidSignature });
+	});
+
+	test('reordering signed parameters is rejected, including reordering duplicates', async () => {
+		const distinct = `program=%2Fbin%2Fsh&request=launch&${CSRF_TS_PARAM}=${NOW}`;
+		const distinctToken = extractToken(await signQuery(PATH, distinct))!;
+		const reordered = `request=launch&program=%2Fbin%2Fsh&${CSRF_TS_PARAM}=${NOW}&${CSRF_TOKEN_PARAM}=${distinctToken}`;
+		assert.deepStrictEqual(await verifyCsrfToken(secret, AUTHORITY, PATH, reordered, NOW), { ok: false, reason: CsrfRejectionReason.InvalidSignature });
+
+		// Duplicates matter too: an extension that reads the first (or last) `a` must not be steerable
+		// by swapping them in a captured link.
+		const duplicates = `a=1&a=2&${CSRF_TS_PARAM}=${NOW}`;
+		const duplicatesToken = extractToken(await signQuery(PATH, duplicates))!;
+		const swapped = `a=2&a=1&${CSRF_TS_PARAM}=${NOW}&${CSRF_TOKEN_PARAM}=${duplicatesToken}`;
+		assert.deepStrictEqual(await verifyCsrfToken(secret, AUTHORITY, PATH, swapped, NOW), { ok: false, reason: CsrfRejectionReason.InvalidSignature });
+	});
+
+	test('a valueless `a` and an empty-valued `a=` do not collide', async () => {
+		const signed = await signQuery(PATH, `a&${CSRF_TS_PARAM}=${NOW}`);
+		assert.deepStrictEqual(await verifyCsrfToken(secret, AUTHORITY, PATH, signed, NOW), { ok: true });
+
+		const respelled = `a=&${CSRF_TS_PARAM}=${NOW}&${CSRF_TOKEN_PARAM}=${extractToken(signed)}`;
+		assert.deepStrictEqual(await verifyCsrfToken(secret, AUTHORITY, PATH, respelled, NOW), { ok: false, reason: CsrfRejectionReason.InvalidSignature });
 	});
 
 	test('a token minted for one route does not validate against another (path binding)', async () => {
@@ -142,5 +174,15 @@ suite('ExtHostUriHandlerCsrf', () => {
 		const signed = await sign(PATH, { program: '/bin/sh' }, NOW + MAX_TOKEN_FUTURE_SKEW_MS + 1);
 		const result = await verifyCsrfToken(secret, AUTHORITY, PATH, signed, NOW);
 		assert.deepStrictEqual(result, { ok: false, reason: CsrfRejectionReason.Expired });
+	});
+
+	test('a secret capped by a rotation cutoff only vouches for links signed before it', async () => {
+		const cutoff = NOW - 60 * 1000;
+
+		const beforeCutoff = await sign(PATH, { program: '/bin/sh' }, cutoff - 60 * 1000);
+		assert.deepStrictEqual(await verifyCsrfToken(secret, AUTHORITY, PATH, beforeCutoff, NOW, '', cutoff), { ok: true });
+
+		const afterCutoff = await sign(PATH, { program: '/bin/sh' }, cutoff + 1);
+		assert.deepStrictEqual(await verifyCsrfToken(secret, AUTHORITY, PATH, afterCutoff, NOW, '', cutoff), { ok: false, reason: CsrfRejectionReason.Expired });
 	});
 });

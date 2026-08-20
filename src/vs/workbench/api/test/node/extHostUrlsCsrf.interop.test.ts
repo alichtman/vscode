@@ -30,18 +30,19 @@ const SIGNER_CLI = `
 const { createHmac } = require('crypto');
 const { readFileSync } = require('fs');
 const [, , secretFile, extensionId, uriPath, ...kv] = process.argv;
-const params = Object.fromEntries(kv.map(s => { const i = s.indexOf('='); return [s.slice(0, i), s.slice(i + 1)]; }));
+const params = kv.map(s => { const i = s.indexOf('='); return [s.slice(0, i), s.slice(i + 1)]; });
+params.push(['vscode-csrf-ts', String(Date.now())]);
 const secret = Buffer.from(JSON.parse(readFileSync(secretFile, 'utf8')).secret, 'base64');
-const signed = Object.assign({}, params, { 'vscode-csrf-ts': String(Date.now()) });
-const sorted = Object.entries(signed).sort(([ak, av], [bk, bv]) => ak < bk ? -1 : ak > bk ? 1 : av < bv ? -1 : av > bv ? 1 : 0);
-const canonical = [encodeURIComponent(extensionId.toLowerCase()), encodeURIComponent(uriPath), '']
-	.concat(sorted.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)))
-	.join('\\n');
+// The signature covers the query exactly as the handler will receive it: same order, same
+// duplicates, and already percent-decoded, because VS Code decodes the query once when it parses
+// the link. Only the token itself is left out of the signed message.
+const decodedQuery = params.map(([k, v]) => k + '=' + v).join('&');
+const canonical = [extensionId.toLowerCase(), uriPath, '', decodedQuery].map(encodeURIComponent).join('\\n');
 const token = createHmac('sha256', secret).update(canonical).digest('hex');
-const query = sorted.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v))
+const wireQuery = params.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v))
 	.concat('vscode-csrf-token=' + token)
 	.join('&');
-process.stdout.write('vscode://' + extensionId + uriPath + '?' + query);
+process.stdout.write('vscode://' + extensionId + uriPath + '?' + wireQuery);
 `;
 
 async function waitForFile(path: string): Promise<void> {
@@ -125,6 +126,25 @@ suite('ExtHostUrls CSRF — external CLI signer interop', () => {
 		assert.ok(received, 'a link signed by the external CLI must reach the handler');
 		assert.strictEqual(received!.path, '/start');
 		assert.strictEqual(rejections, 0);
+	});
+
+	test('an externally signed link keeps its parameter order and duplicates all the way to the handler', async () => {
+		const link = await signWithExternalCli(secretPath, '/start', 'tag=b', 'tag=a', 'program=/bin/sh');
+
+		await extHostUrls.$handleExternalUri(handle, URI.parse(link).toJSON());
+
+		assert.strictEqual(received?.query, 'tag=b&tag=a&program=/bin/sh', 'the handler must see exactly what was signed');
+		assert.strictEqual(rejections, 0);
+	});
+
+	test('reordering the duplicates of an externally signed link is rejected end-to-end', async () => {
+		const link = await signWithExternalCli(secretPath, '/start', 'tag=b', 'tag=a');
+		const reordered = link.replace('tag=b&tag=a', 'tag=a&tag=b');
+
+		await extHostUrls.$handleExternalUri(handle, URI.parse(reordered).toJSON());
+
+		assert.strictEqual(received, undefined, 'a handler that reads the first `tag` must not be steerable by reordering');
+		assert.strictEqual(rejections, 1);
 	});
 
 	test('a tampered CLI deeplink is rejected end-to-end', async () => {

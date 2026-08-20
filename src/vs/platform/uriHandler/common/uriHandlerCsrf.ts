@@ -12,6 +12,9 @@ export const CSRF_TOKEN_PARAM = 'vscode-csrf-token';
 /** Reserved query parameter carrying the unix-ms timestamp the link was signed at. */
 export const CSRF_TS_PARAM = 'vscode-csrf-ts';
 
+const CSRF_TOKEN_PARAMS = new Set([CSRF_TOKEN_PARAM]);
+const CSRF_RESERVED_PARAMS = new Set([CSRF_TOKEN_PARAM, CSRF_TS_PARAM]);
+
 /** Maximum age of a signed link. */
 export const MAX_TOKEN_AGE_MS = 4 * 60 * 60 * 1000; // 4 hours
 
@@ -98,15 +101,24 @@ function safeDecode(value: string): string {
 	}
 }
 
+function isReservedQueryParam(part: string, reserved: ReadonlySet<string>): boolean {
+	const eq = part.indexOf('=');
+	return reserved.has(safeDecode(eq === -1 ? part : part.slice(0, eq)));
+}
+
 /**
  * Canonical form shared by the CLI signer and extension-host verifier. It binds the token to the
- * normalized extension authority, URI path, fragment, and every non-reserved query parameter while
- * normalizing query ordering and percent encoding.
+ * normalized extension authority, URI path, fragment, and the *exact* query serialization that
+ * `handleUri` is about to receive: only the token parameter itself is removed, and nothing else is
+ * reordered, deduplicated, or re-encoded. Reordering parameters, swapping two duplicates of the
+ * same key, or rewriting `a` as `a=` therefore all yield a different message and a different HMAC.
+ *
+ * Note that `query` is the query as `URI` exposes it, i.e. already percent-decoded once. Signers
+ * must canonicalize that same representation rather than the on-the-wire spelling.
  */
 export function canonicalize(authority: string, path: string, query: string, fragment: string = ''): string {
-	const params = parseQuery(query).filter(p => p.key !== CSRF_TOKEN_PARAM);
-	params.sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : a.value < b.value ? -1 : a.value > b.value ? 1 : 0);
-	return [encodeURIComponent(authority.toLowerCase()), encodeURIComponent(path), encodeURIComponent(fragment), ...params.map(p => `${encodeURIComponent(p.key)}=${encodeURIComponent(p.value)}`)].join('\n');
+	const signedQuery = query.split('&').filter(part => !isReservedQueryParam(part, CSRF_TOKEN_PARAMS)).join('&');
+	return [encodeURIComponent(authority.toLowerCase()), encodeURIComponent(path), encodeURIComponent(fragment), encodeURIComponent(signedQuery)].join('\n');
 }
 
 function extractParam(query: string, key: string): string | undefined {
@@ -127,14 +139,7 @@ export function stripCsrfToken(uri: URI): URI {
 	if (!uri.query) {
 		return uri;
 	}
-	const kept = uri.query.split('&').filter(part => {
-		if (!part) {
-			return false;
-		}
-		const eq = part.indexOf('=');
-		const rawKey = safeDecode(eq === -1 ? part : part.slice(0, eq));
-		return rawKey !== CSRF_TOKEN_PARAM && rawKey !== CSRF_TS_PARAM;
-	});
+	const kept = uri.query.split('&').filter(part => !!part && !isReservedQueryParam(part, CSRF_RESERVED_PARAMS));
 	return uri.with({ query: kept.join('&') });
 }
 
@@ -173,7 +178,14 @@ export const enum CsrfRejectionReason {
 
 export type CsrfVerifyResult = { readonly ok: true } | { readonly ok: false; readonly reason: CsrfRejectionReason };
 
-export async function verifyCsrfToken(secret: Uint8Array | undefined, authority: string, path: string, query: string, now: number, fragment: string = ''): Promise<CsrfVerifyResult> {
+/**
+ * Verify the token carried by `query` against `secret`.
+ *
+ * `maxTokenTimestamp` is the newest signing timestamp `secret` may vouch for. It is what stops a
+ * rotated-out key from minting fresh links: the retired key stays usable for the links that were
+ * genuinely signed before it was retired, and nothing newer.
+ */
+export async function verifyCsrfToken(secret: Uint8Array | undefined, authority: string, path: string, query: string, now: number, fragment: string = '', maxTokenTimestamp: number = Number.POSITIVE_INFINITY): Promise<CsrfVerifyResult> {
 	const claimed = extractToken(query);
 	if (claimed === undefined) {
 		return { ok: false, reason: CsrfRejectionReason.Missing };
@@ -186,7 +198,7 @@ export async function verifyCsrfToken(secret: Uint8Array | undefined, authority:
 		return { ok: false, reason: CsrfRejectionReason.InvalidSignature };
 	}
 	const ts = Number(extractParam(query, CSRF_TS_PARAM));
-	if (!Number.isFinite(ts) || now - ts > MAX_TOKEN_AGE_MS || ts - now > MAX_TOKEN_FUTURE_SKEW_MS) {
+	if (!Number.isFinite(ts) || now - ts > MAX_TOKEN_AGE_MS || ts - now > MAX_TOKEN_FUTURE_SKEW_MS || ts > maxTokenTimestamp) {
 		return { ok: false, reason: CsrfRejectionReason.Expired };
 	}
 	return { ok: true };

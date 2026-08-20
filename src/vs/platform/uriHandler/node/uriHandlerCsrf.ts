@@ -5,16 +5,18 @@
 
 import { randomBytes } from 'crypto';
 import { constants as fsConstants, promises as fs, Stats } from 'fs';
+import { hostname } from 'os';
 import { Schemas } from '../../../base/common/network.js';
 import { dirname, isAbsolute, join } from '../../../base/common/path.js';
 import { URI } from '../../../base/common/uri.js';
 import { IExtension } from '../../extensions/common/extensions.js';
 import { ILogService } from '../../log/common/log.js';
-import { resolveUriHandlerCsrfManifest, signUri } from '../common/uriHandlerCsrf.js';
+import { MAX_TOKEN_FUTURE_SKEW_MS, resolveUriHandlerCsrfManifest, signUri } from '../common/uriHandlerCsrf.js';
 
 const SECRET_BYTES = 64;
 const SECRET_FILE_NAME = 'uri-csrf.secret';
 const ROTATION_MS = 24 * 60 * 60 * 1000;
+const ROTATION_LOCK_STALE_MS = 5 * 60 * 1000;
 const MAX_SECRET_FILE_BYTES = 16 * 1024;
 
 export interface IUriHandlerCsrfSecretLocation {
@@ -93,20 +95,47 @@ interface ISecretFile {
 	readonly version: number;
 	readonly secret: string;
 	readonly previousSecret?: string;
+	readonly previousSecretValidBefore?: number;
 	readonly createdAt: number;
+}
+
+export interface IUriHandlerCsrfPreviousSecret {
+	readonly secret: Uint8Array;
+	readonly validBefore: number;
 }
 
 interface IReadSecretFile {
 	readonly secret: Uint8Array;
-	readonly previousSecret?: Uint8Array;
+	readonly previousSecret?: IUriHandlerCsrfPreviousSecret;
 	readonly createdAt: number;
 	readonly stat: Stats;
+}
+
+interface IRotationLockMetadata {
+	readonly pid: number;
+	readonly hostname: string;
+	readonly createdAt: number;
 }
 
 type SecretReadResult =
 	| { readonly kind: 'valid'; readonly value: IReadSecretFile }
 	| { readonly kind: 'missing' }
 	| { readonly kind: 'invalid' };
+
+/** `directory` and every ancestor above it, ordered from the filesystem root downwards. */
+function ancestorChain(directory: string): string[] {
+	const chain: string[] = [];
+	let current = directory;
+	while (true) {
+		chain.push(current);
+		const parent = dirname(current);
+		if (parent === current) {
+			break;
+		}
+		current = parent;
+	}
+	return chain.reverse();
+}
 
 /** Owner/group-only, rotating secret store shared by the extension host and CLI signer. */
 export class CsrfSecretStore {
@@ -135,7 +164,7 @@ export class CsrfSecretStore {
 		}
 	}
 
-	async getPreviousSecret(secretFile: URI): Promise<Uint8Array | undefined> {
+	async getPreviousSecret(secretFile: URI): Promise<IUriHandlerCsrfPreviousSecret | undefined> {
 		const path = secretFile.fsPath;
 		if (!await this.ensureTrustedParent(path, false)) {
 			return undefined;
@@ -151,18 +180,9 @@ export class CsrfSecretStore {
 		}
 
 		const lockPath = `${path}.lock`;
-		let lock;
-		try {
-			lock = await fs.open(lockPath, 'wx', 0o600);
-		} catch (err) {
-			const code = (err as NodeJS.ErrnoException).code;
-			if (code === 'EEXIST') {
-				return; // another window or process is already rotating this secret
-			}
-			if (code === 'ENOENT') {
-				return; // the extension storage was removed after the parent check
-			}
-			throw err;
+		const lock = await this.acquireRotationLock(lockPath);
+		if (!lock) {
+			return;
 		}
 
 		try {
@@ -187,6 +207,89 @@ export class CsrfSecretStore {
 		}
 	}
 
+	/**
+	 * Take the inter-process rotation lock, reclaiming it once from a holder that will never release
+	 * it (a crashed window, or a stale lock left behind on a shared volume). Returns `undefined` when
+	 * a live holder owns it — rotation is best-effort, so losing the race is not an error.
+	 */
+	private async acquireRotationLock(lockPath: string): Promise<Awaited<ReturnType<typeof fs.open>> | undefined> {
+		for (let attempt = 0; attempt < 2; attempt++) {
+			let handle;
+			try {
+				handle = await fs.open(lockPath, 'wx', 0o600);
+			} catch (err) {
+				const code = (err as NodeJS.ErrnoException).code;
+				if (code === 'ENOENT') {
+					return undefined; // the extension storage was removed after the parent check
+				}
+				if (code !== 'EEXIST') {
+					throw err;
+				}
+				if (attempt === 0 && await this.isAbandonedRotationLock(lockPath)) {
+					try {
+						await fs.unlink(lockPath);
+					} catch (unlinkError) {
+						if ((unlinkError as NodeJS.ErrnoException).code !== 'ENOENT') {
+							throw unlinkError;
+						}
+					}
+					continue;
+				}
+				return undefined; // another window or process is already rotating this secret
+			}
+
+			try {
+				const metadata: IRotationLockMetadata = { pid: process.pid, hostname: hostname(), createdAt: Date.now() };
+				await handle.writeFile(JSON.stringify(metadata), 'utf8');
+				await handle.sync();
+				return handle;
+			} catch (err) {
+				await handle.close().catch(() => undefined);
+				await fs.unlink(lockPath).catch(() => undefined);
+				throw err;
+			}
+		}
+		return undefined;
+	}
+
+	/**
+	 * Whether a lock file can be taken from its holder. A lock is only ever a candidate once it is
+	 * older than {@link ROTATION_LOCK_STALE_MS}; past that, a same-host lock is reclaimed when its
+	 * process is gone, and one whose metadata is unreadable or written by another host is reclaimed
+	 * on age alone. A lock whose owning process is still alive is never taken, no matter how old.
+	 */
+	private async isAbandonedRotationLock(lockPath: string): Promise<boolean> {
+		let stat: Stats;
+		try {
+			stat = await fs.lstat(lockPath);
+		} catch (err) {
+			return (err as NodeJS.ErrnoException).code === 'ENOENT';
+		}
+		if (!stat.isFile() || Date.now() - stat.mtimeMs <= ROTATION_LOCK_STALE_MS) {
+			return false;
+		}
+
+		let handle;
+		try {
+			const flags = process.platform === 'win32' ? fsConstants.O_RDONLY : fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW;
+			handle = await fs.open(lockPath, flags);
+			const metadata = JSON.parse(await handle.readFile('utf8')) as Partial<IRotationLockMetadata>;
+			if (metadata.hostname === hostname() && Number.isSafeInteger(metadata.pid) && metadata.pid! > 0) {
+				try {
+					process.kill(metadata.pid!, 0);
+					return false;
+				} catch (err) {
+					return (err as NodeJS.ErrnoException).code === 'ESRCH';
+				}
+			}
+			return true;
+		} catch {
+			return true; // an old or truncated lock can be reclaimed once its age threshold passes
+		} finally {
+			await handle?.close().catch(() => undefined);
+		}
+	}
+
 	private isTrusted(stat: Stats, path: string): boolean {
 		if (!stat.isFile()) {
 			this.logService.warn(`[uri-csrf] secret path ${path} is not a regular file; refusing to trust it`);
@@ -201,6 +304,13 @@ export class CsrfSecretStore {
 		}
 		if ((stat.mode & 0o007) !== 0) {
 			this.logService.warn(`[uri-csrf] secret file ${path} is world-accessible (mode ${(stat.mode & 0o777).toString(8)}); refusing to trust it`);
+			return false;
+		}
+		// Group write is only acceptable alongside group read (0660, e.g. a companion daemon that has to
+		// sign links anyway). Write without read (0620) hands a group that cannot legitimately sign the
+		// ability to plant a secret of its own choosing.
+		if ((stat.mode & 0o020) !== 0 && (stat.mode & 0o040) === 0) {
+			this.logService.warn(`[uri-csrf] secret file ${path} grants group write access without group read access; refusing to trust it`);
 			return false;
 		}
 
@@ -235,9 +345,22 @@ export class CsrfSecretStore {
 			}
 
 			const secret = this.decodeSecret(parsed.secret);
-			const previousSecret = parsed.previousSecret === undefined ? undefined : this.decodeSecret(parsed.previousSecret);
-			if (!secret || (parsed.previousSecret !== undefined && !previousSecret)) {
+			if (!secret) {
 				return { kind: 'invalid' };
+			}
+
+			let previousSecret: IUriHandlerCsrfPreviousSecret | undefined;
+			if (parsed.previousSecret !== undefined) {
+				const decodedPrevious = this.decodeSecret(parsed.previousSecret);
+				if (!decodedPrevious) {
+					return { kind: 'invalid' };
+				}
+				// A file written before rotation cutoffs existed carries no bound for its retired key.
+				// Ignore that key rather than let it keep signing fresh links; the current key is still
+				// trustworthy, so the file as a whole stays usable.
+				if (Number.isFinite(parsed.previousSecretValidBefore)) {
+					previousSecret = { secret: decodedPrevious, validBefore: parsed.previousSecretValidBefore! };
+				}
 			}
 			return { kind: 'valid', value: { secret, previousSecret, createdAt: parsed.createdAt, stat } };
 		} catch (err) {
@@ -260,11 +383,13 @@ export class CsrfSecretStore {
 	}
 
 	private newContents(previous?: Uint8Array): ISecretFile {
+		const now = Date.now();
 		return {
 			version: 1,
 			secret: randomBytes(SECRET_BYTES).toString('base64'),
 			previousSecret: previous ? Buffer.from(previous).toString('base64') : undefined,
-			createdAt: Date.now(),
+			previousSecretValidBefore: previous ? now + MAX_TOKEN_FUTURE_SKEW_MS : undefined,
+			createdAt: now,
 		};
 	}
 
@@ -345,34 +470,63 @@ export class CsrfSecretStore {
 		}
 
 		try {
-			const directParent = await fs.lstat(parent);
-			if (directParent.isSymbolicLink() || !directParent.isDirectory()) {
-				this.logService.warn(`[uri-csrf] secret directory ${parent} must be a real directory, not a symlink`);
-				return false;
+			// Two walks are needed. The lexical one covers the ancestors the *written* path traverses,
+			// which a symlink can otherwise hide: `/world-writable/link/secret` where `link` points at a
+			// safe directory resolves to a safe chain, yet anyone can repoint `link`. The realpath one
+			// covers the ancestors the secret actually lives under.
+			for (const candidate of ancestorChain(parent)) {
+				const stat = await fs.lstat(candidate);
+				if (stat.isSymbolicLink()) {
+					// An intermediate symlink planted by the system or by this user is normal (macOS
+					// resolves `/var` to `/private/var`, and `/tmp` to `/private/tmp`), but the directory
+					// holding the secret must be real so it cannot be swapped out from under us.
+					if (candidate === parent || !this.isTrustedSymlink(stat, candidate)) {
+						this.logService.warn(`[uri-csrf] secret directory ${candidate} is an untrusted symlink; refusing to use it`);
+						return false;
+					}
+					continue;
+				}
+				if (!stat.isDirectory()) {
+					this.logService.warn(`[uri-csrf] secret directory chain contains a non-directory at ${candidate}`);
+					return false;
+				}
+				if (process.platform !== 'win32' && !this.isTrustedDirectory(stat, candidate)) {
+					return false;
+				}
 			}
 
-			let current = await fs.realpath(parent);
-			while (true) {
-				const stat = await fs.lstat(current);
+			for (const candidate of ancestorChain(await fs.realpath(parent))) {
+				const stat = await fs.lstat(candidate);
 				if (!stat.isDirectory() || stat.isSymbolicLink()) {
-					this.logService.warn(`[uri-csrf] secret directory chain contains a non-directory at ${current}`);
+					this.logService.warn(`[uri-csrf] secret directory chain contains a non-directory at ${candidate}`);
 					return false;
 				}
-				if (process.platform !== 'win32' && !this.isTrustedDirectory(stat, current)) {
+				if (process.platform !== 'win32' && !this.isTrustedDirectory(stat, candidate)) {
 					return false;
 				}
-
-				const parentPath = dirname(current);
-				if (parentPath === current) {
-					break;
-				}
-				current = parentPath;
 			}
 			return true;
 		} catch (err) {
 			this.logService.warn(`[uri-csrf] failed to validate secret directory ${parent}`, err);
 			return false;
 		}
+	}
+
+	/**
+	 * Whether an *intermediate* symlink on the way to the secret directory can be trusted. Only the
+	 * system and the current user may plant one; a link owned by an unrelated user could be repointed
+	 * at a directory they control.
+	 */
+	private isTrustedSymlink(stat: Stats, path: string): boolean {
+		if (process.platform === 'win32') {
+			return true;
+		}
+		const effectiveUser = process.geteuid?.();
+		if (effectiveUser === undefined || effectiveUser === 0 || stat.uid === 0 || stat.uid === effectiveUser) {
+			return true;
+		}
+		this.logService.warn(`[uri-csrf] symbolic-link path component ${path} is owned by an unrelated user`);
+		return false;
 	}
 
 	private isTrustedDirectory(stat: Stats, path: string): boolean {

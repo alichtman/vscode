@@ -110,10 +110,12 @@ export class NodeExtHostUriHandlerCsrf implements IExtHostUriHandlerCsrf {
 		let result = await verifyCsrfToken(secret, uri.authority, uri.path, uri.query, now, uri.fragment);
 		if (!result.ok && result.reason === CsrfRejectionReason.InvalidSignature) {
 			// Fall back to the just-rotated-out secret, so a link signed right before a rotation (e.g.
-			// the deeplink that woke VS Code) still verifies.
+			// the deeplink that woke VS Code) still verifies. `validBefore` caps that grace at the
+			// moment of rotation (plus the tolerated clock skew), so a retired key can only vouch for
+			// links that predate its retirement — it can never mint a fresh one.
 			const previous = await this.store.getPreviousSecret(secretFile).catch(() => undefined);
 			if (previous) {
-				result = await verifyCsrfToken(previous, uri.authority, uri.path, uri.query, now, uri.fragment);
+				result = await verifyCsrfToken(previous.secret, uri.authority, uri.path, uri.query, now, uri.fragment, previous.validBefore);
 			}
 		}
 		return result.ok;

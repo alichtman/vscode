@@ -4,8 +4,9 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as assert from 'assert';
+import { spawn } from 'child_process';
 import { promises as fs } from 'fs';
-import { tmpdir } from 'os';
+import { hostname, tmpdir } from 'os';
 import { join } from '../../../../base/common/path.js';
 import { URI } from '../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
@@ -93,6 +94,29 @@ suite('CsrfSecretStore (integration)', () => {
 		assert.strictEqual(await store.getSecret(URI.file(join(unsafeDirectory, 'uri-csrf.secret'))), undefined);
 	});
 
+	(isWindows ? test.skip : test)('rejects a path through an unsafe ancestor even when the symlink resolves somewhere safe', async () => {
+		// Resolving first would only ever see dir/safe/storage (0700) and trust it, but anyone can
+		// repoint `link` because dir/unsafe is world-writable.
+		const unsafeDirectory = join(dir, 'unsafe');
+		const safeDirectory = join(dir, 'safe');
+		await fs.mkdir(join(safeDirectory, 'storage'), { recursive: true, mode: 0o700 });
+		await fs.mkdir(unsafeDirectory, { mode: 0o700 });
+		await fs.symlink(safeDirectory, join(unsafeDirectory, 'link'));
+		await fs.chmod(unsafeDirectory, 0o777);
+
+		assert.strictEqual(await store.getSecret(URI.file(join(unsafeDirectory, 'link', 'storage', 'uri-csrf.secret'))), undefined);
+	});
+
+	(isWindows ? test.skip : test)('allows an intermediate symlink owned by this user (as macOS /var and /tmp require)', async () => {
+		const realDirectory = join(dir, 'real');
+		await fs.mkdir(realDirectory, { mode: 0o700 });
+		await fs.symlink(realDirectory, join(dir, 'link'));
+
+		const secret = await store.getSecret(URI.file(join(dir, 'link', 'storage', 'uri-csrf.secret')));
+		assert.ok(secret, 'a trusted intermediate symlink must not block the secret');
+		assert.ok((await fs.stat(join(realDirectory, 'storage', 'uri-csrf.secret'))).isFile());
+	});
+
 	async function ageSecret(file: URI): Promise<void> {
 		const parsed = JSON.parse(await fs.readFile(file.fsPath, 'utf8'));
 		parsed.createdAt = Date.now() - 25 * 60 * 60 * 1000;
@@ -126,7 +150,73 @@ suite('CsrfSecretStore (integration)', () => {
 		const current = await store.getSecret(file);
 		const previous = await store.getPreviousSecret(file);
 		assert.notDeepStrictEqual(Array.from(current!), Array.from(first!));
-		assert.deepStrictEqual(Array.from(previous!), Array.from(first!));
+		assert.deepStrictEqual(Array.from(previous!.secret), Array.from(first!));
+	});
+
+	/** The pid of a process that has certainly exited, so `kill(pid, 0)` reports it as gone. */
+	async function exitedPid(): Promise<number> {
+		const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } });
+		await new Promise<void>(resolve => child.once('exit', () => resolve()));
+		return child.pid!;
+	}
+
+	/** Plant a rotation lock with the given metadata and back-date it by `ageMs`. */
+	async function writeRotationLock(file: URI, metadata: object, ageMs: number): Promise<string> {
+		const lockPath = `${file.fsPath}.lock`;
+		await fs.writeFile(lockPath, JSON.stringify(metadata), { mode: 0o600 });
+		const backdated = new Date(Date.now() - ageMs);
+		await fs.utimes(lockPath, backdated, backdated);
+		return lockPath;
+	}
+
+	/** A secret that is due for rotation, plus the bytes it currently holds. */
+	async function staleSecret(): Promise<{ file: URI; original: Uint8Array }> {
+		const file = secretUri();
+		const original = (await store.getSecret(file))!;
+		await ageSecret(file);
+		return { file, original };
+	}
+
+	const ABANDONED_LOCK_AGE_MS = 10 * 60 * 1000; // past the store's 5-minute staleness threshold
+
+	test('rotation reclaims a lock whose owning process is gone', async () => {
+		const { file, original } = await staleSecret();
+		const lockPath = await writeRotationLock(file, { pid: await exitedPid(), hostname: hostname(), createdAt: Date.now() - ABANDONED_LOCK_AGE_MS }, ABANDONED_LOCK_AGE_MS);
+
+		await store.rotateIfStale(file);
+
+		assert.notDeepStrictEqual(Array.from((await store.getSecret(file))!), Array.from(original), 'a lock left by a crashed window must not block rotation forever');
+		await assert.rejects(fs.access(lockPath), 'the reclaimed lock must be released again');
+	});
+
+	test('rotation reclaims a stale lock whose metadata it cannot vouch for', async () => {
+		const { file, original } = await staleSecret();
+		// Written by another host (a shared home directory), so the local pid says nothing about it.
+		await writeRotationLock(file, { pid: process.pid, hostname: `${hostname()}-elsewhere`, createdAt: Date.now() - ABANDONED_LOCK_AGE_MS }, ABANDONED_LOCK_AGE_MS);
+
+		await store.rotateIfStale(file);
+
+		assert.notDeepStrictEqual(Array.from((await store.getSecret(file))!), Array.from(original), 'an unattributable lock must be reclaimed once it is stale');
+	});
+
+	test('rotation never steals a lock held by a live process, however old', async () => {
+		const { file, original } = await staleSecret();
+		const lockPath = await writeRotationLock(file, { pid: process.pid, hostname: hostname(), createdAt: Date.now() - ABANDONED_LOCK_AGE_MS }, ABANDONED_LOCK_AGE_MS);
+
+		await store.rotateIfStale(file);
+
+		assert.deepStrictEqual(Array.from((await store.getSecret(file))!), Array.from(original), 'a live holder must keep the lock');
+		await fs.access(lockPath); // throws if the lock was taken away
+	});
+
+	test('rotation waits behind a lock that is not yet stale', async () => {
+		const { file, original } = await staleSecret();
+		const lockPath = await writeRotationLock(file, {}, 0);
+
+		await store.rotateIfStale(file);
+
+		assert.deepStrictEqual(Array.from((await store.getSecret(file))!), Array.from(original), 'a fresh lock must be respected even with unreadable metadata');
+		await fs.access(lockPath);
 	});
 
 	test('rotateIfStale leaves a fresh secret unchanged', async () => {
@@ -152,7 +242,25 @@ suite('CsrfSecretStore (integration)', () => {
 		const current = await store.getSecret(file);
 		const previous = await store.getPreviousSecret(file);
 		assert.notDeepStrictEqual(Array.from(current!), Array.from(first!), 'the secret should have rotated');
-		assert.deepStrictEqual(Array.from(previous!), Array.from(first!), 'the prior secret should be retained as previous');
+		assert.deepStrictEqual(Array.from(previous!.secret), Array.from(first!), 'the prior secret should be retained as previous');
+		assert.ok(previous!.validBefore > Date.now(), 'the retired secret must carry the cutoff that bounds what it can vouch for');
+	});
+
+	test('a previous secret with no rotation cutoff is ignored, but the current secret is kept', async () => {
+		const file = secretUri();
+		await store.getSecret(file);
+		await ageSecret(file);
+		await store.rotateIfStale(file);
+
+		// A secret file written before rotation cutoffs existed.
+		const rotated = JSON.parse(await fs.readFile(file.fsPath, 'utf8'));
+		const current = rotated.secret;
+		delete rotated.previousSecretValidBefore;
+		await fs.writeFile(file.fsPath, JSON.stringify(rotated), { mode: 0o600 });
+
+		const secret = await store.getSecret(file);
+		assert.strictEqual(Buffer.from(secret!).toString('base64'), current, 'the current secret must stay usable');
+		assert.strictEqual(await store.getPreviousSecret(file), undefined, 'an unbounded previous secret must be ignored');
 	});
 
 	test('end-to-end: a link signed with the stored secret verifies, and tampering is rejected', async () => {
@@ -195,5 +303,13 @@ suite('CsrfSecretStore (integration)', () => {
 		const secret = await store.getSecret(file);
 		assert.ok(secret, 'a group-accessible (but not world-accessible) secret must be trusted');
 		assert.deepStrictEqual(Array.from(secret!), Array.from(created!), 'the same secret should be returned');
+	});
+
+	(isWindows ? test.skip : test)('rejects a group-writable secret the group cannot read (POSIX)', async () => {
+		const file = secretUri();
+		await store.getSecret(file); // create it 0600
+		await fs.chmod(file.fsPath, 0o620); // the group can plant a secret but could never legitimately sign with one
+
+		assert.strictEqual(await store.getSecret(file), undefined, 'a write-only-for-group secret must not be trusted');
 	});
 });

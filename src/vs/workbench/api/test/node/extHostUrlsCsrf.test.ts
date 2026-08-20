@@ -71,11 +71,17 @@ suite('ExtHostUrls CSRF dispatch (integration)', () => {
 		disposables.add(extHostUrls.registerUriHandler(makeExtension(csrfProtection), { handleUri: uri => { received = uri; } }, options));
 	}
 
-	async function signedUri(path: string, params: Record<string, string>, ts: number = Date.now()): Promise<URI> {
-		const all: Record<string, string> = { ...params, [CSRF_TS_PARAM]: String(ts) };
-		const base = Object.entries(all).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
-		const token = await computeToken(secret, 'test.ext', path, base);
-		return URI.parse(`vscode://test.ext${path}?${base}&${CSRF_TOKEN_PARAM}=${token}`);
+	/**
+	 * Produce a link exactly as a companion tool would: percent-encoded on the wire, but signed over
+	 * the decoded serialization, because `URI` decodes the query once while parsing the link and that
+	 * decoded form is what both the verifier and `handleUri` see.
+	 */
+	async function signedUri(path: string, params: Record<string, string>, ts: number = Date.now(), signWith: Uint8Array = secret): Promise<URI> {
+		const entries: [string, string][] = [...Object.entries(params), [CSRF_TS_PARAM, String(ts)]];
+		const signedQuery = entries.map(([k, v]) => `${k}=${v}`).join('&');
+		const wireQuery = entries.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
+		const token = await computeToken(signWith, 'test.ext', path, signedQuery);
+		return URI.parse(`vscode://test.ext${path}?${wireQuery}&${CSRF_TOKEN_PARAM}=${token}`);
 	}
 
 	test('a valid signed link reaches the handler with CSRF params stripped', async () => {
@@ -155,19 +161,51 @@ suite('ExtHostUrls CSRF dispatch (integration)', () => {
 		assert.strictEqual(rejections.length, 0);
 	});
 
-	test('a link signed with the previous secret still verifies right after a (wake-up) rotation', async () => {
-		register({ unsupportedPlatforms: 'reject' });
-		const uri = await signedUri('/start', { program: '/bin/sh' }); // signed with the current secret
-
-		// Simulate waking after >24h: age the secret and rotate it out (old becomes "previous").
+	/** Age the on-disk secret past the rotation window and rotate it out, so `secret` becomes previous. */
+	async function rotateSecretOut(): Promise<string> {
 		const secretPath = join(dir, 'uri-csrf.secret');
 		const parsed = JSON.parse(await fs.readFile(secretPath, 'utf8'));
 		parsed.createdAt = Date.now() - 25 * 60 * 60 * 1000;
 		await fs.writeFile(secretPath, JSON.stringify(parsed), { mode: 0o600 });
 		await new CsrfSecretStore(new NullLogService()).rotateIfStale(URI.file(secretPath));
+		return secretPath;
+	}
+
+	test('a link signed with the previous secret still verifies right after a (wake-up) rotation', async () => {
+		const uri = await signedUri('/start', { program: '/bin/sh' }); // signed with the current secret
+
+		// Simulate waking after >24h: age the secret and rotate it out (old becomes "previous"), then
+		// register as the extension host would on the wake-up that the deeplink triggered.
+		await rotateSecretOut();
+		register({ unsupportedPlatforms: 'reject' });
 
 		await extHostUrls.$handleExternalUri(handle, uri.toJSON());
 		assert.ok(received, 'a link signed with the previous secret must still verify after rotation');
 		assert.strictEqual(rejections.length, 0);
+	});
+
+	test('a retired secret verifies pre-rotation links but can never mint a fresh one', async () => {
+		const retired = secret;
+		const secretPath = await rotateSecretOut();
+
+		// Back-date the rotation cutoff so "now" is well past it, as it would be an hour after a
+		// rotation that happened while VS Code was running.
+		const rotatedAt = Date.now() - 60 * 60 * 1000;
+		const rotated = JSON.parse(await fs.readFile(secretPath, 'utf8'));
+		assert.strictEqual(rotated.previousSecret, Buffer.from(retired).toString('base64'), 'the retired key should be kept as previous');
+		rotated.previousSecretValidBefore = rotatedAt;
+		await fs.writeFile(secretPath, JSON.stringify(rotated), { mode: 0o600 });
+		register({ unsupportedPlatforms: 'reject' });
+
+		const preRotation = await signedUri('/start', { program: '/bin/sh' }, rotatedAt - 60 * 1000, retired);
+		await extHostUrls.$handleExternalUri(handle, preRotation.toJSON());
+		assert.ok(received, 'a link signed before the rotation must still be honored');
+		assert.strictEqual(rejections.length, 0);
+
+		received = undefined;
+		const freshlyMinted = await signedUri('/start', { program: '/bin/sh' }, Date.now(), retired);
+		await extHostUrls.$handleExternalUri(handle, freshlyMinted.toJSON());
+		assert.strictEqual(received, undefined, 'a rotated-out key must not be able to sign new links');
+		assert.deepStrictEqual(rejections, ['Test Ext']);
 	});
 });
