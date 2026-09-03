@@ -39,10 +39,10 @@ vscode.window.registerUriHandler(handler, {
 The manifest declaration wins if both are present.
 
 URI-triggered activation can occur before verification; the guarantee applies when VS Code dispatches
-to `handleUri`, not to extension activation itself. Every protected link that is
-dispatched reaches it with the CSRF parameters already stripped, including exempt links and links on
-platforms configured with `"allow"`. A forged, expired, or unsigned link never reaches an enforced route (the user
-sees a "blocked an unauthenticated link" notification).
+to `handleUri`, not to extension activation itself. Every protected link that is dispatched reaches
+it with the CSRF parameters already stripped, including exempt links and links on platforms
+configured with `"allow"`. A forged, expired, or unsigned link never reaches an enforced route (the
+user sees a "blocked an unauthenticated link" notification).
 
 ---
 
@@ -57,10 +57,53 @@ code --open-url "$signed_uri"
 ```
 
 The command uses the selected profile (`--profile` when provided) and refuses extensions without a
-valid manifest declaration. In an integrated terminal attached to a remote VS Code window, the
-remote `code` CLI signs with the remote extension host's secret. This command is the supported
-signing protocol; companion tools do not need to parse the secret file or reproduce canonicalization
-and rotation.
+valid manifest declaration. This command is the supported signing protocol; companion tools do not
+need to parse the secret file or reproduce canonicalization and rotation.
+
+### Remote extension hosts
+
+Sign on the machine where the URI handler's extension host runs. A remote window alone is not enough:
+a workspace extension running over SSH or in a dev container signs remotely, while a UI extension
+running on the desktop signs locally.
+
+For a remotely running handler:
+
+1. Install the extension on the remote host and declare `csrfProtection` in its manifest. The CLI
+   reads the installed manifest without activating the extension, so a runtime-only declaration
+   cannot be used for CLI signing.
+2. Start the companion tool from an integrated terminal attached to that remote window, or as a
+   descendant of that terminal. VS Code gives the terminal a per-terminal CLI pipe through
+   `VSCODE_IPC_HOOK_CLI`; an unrelated SSH session does not inherit that pipe address.
+3. Ask the remote `code` CLI to sign the URI. It returns the signed URI on standard output:
+
+   ```sh
+   signed_uri="$(code --sign-extension-uri 'vscode://my.ext/run?task=build')"
+   ```
+
+4. Return the URI to the desktop for opening. From the same integrated terminal, the remote CLI
+   bridge can do that directly:
+
+   ```sh
+   code --openExternal "$signed_uri"
+   ```
+
+   `--openExternal` is specific to the remote integrated-terminal bridge. The desktop
+   `code --open-url` form does not traverse that remote pipe.
+
+Internally, the signing request stays on the remote host. The terminal's `code` wrapper sends a
+`signExtensionUri` request over its private pipe. The remote server finds the remotely installed
+extension, validates the URI authority and manifest policy, resolves the extension's remote global
+storage, and provisions or reads the secret there. It signs the path, fragment, timestamp, and all
+non-reserved query parameters, then returns only the signed URI. The secret never crosses to the
+desktop client.
+
+Opening the result may show the normal extension URI trust prompt and may activate the extension.
+The trust dialog hides the globally reserved CSRF parameters, but retains them on the URI sent for
+verification. The URI is then dispatched to the remote extension host, which verifies it against the
+same remote secret. For an enforced, non-exempt route, only after successful verification are the
+reserved parameters stripped and `handleUri` called. Trust, activation, and CSRF verification are
+separate steps; a valid signature does not skip the trust prompt, and verification does not prevent
+activation side effects.
 
 ---
 
