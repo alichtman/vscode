@@ -536,8 +536,17 @@ export class CsrfSecretStore {
 			this.logService.warn(`[uri-csrf] secret directory ${path} is world-writable without the sticky bit; refusing to use it`);
 			return false;
 		}
+		if (worldWritable) {
+			// Sticky prevents other users from deleting or renaming our entry, but the directory owner
+			// retains that ability. Trust the standard root-owned /tmp case and directories we own.
+			const effectiveUser = process.geteuid?.();
+			if (stat.uid !== 0 && stat.uid !== effectiveUser) {
+				this.logService.warn(`[uri-csrf] sticky world-writable secret directory ${path} is owned by an unrelated user; refusing to use it`);
+				return false;
+			}
+		}
 
-		if ((stat.mode & 0o020) !== 0) {
+		if (!worldWritable && (stat.mode & 0o020) !== 0) {
 			const groups = new Set(process.getgroups?.() ?? []);
 			const effectiveGroup = process.getegid?.();
 			if (effectiveGroup !== undefined) {
