@@ -46,6 +46,7 @@ const isSupportedForCmd = (optionId: keyof RemoteParsedArgs) => {
 		case 'extensions-download-dir':
 		case 'builtin-extensions-dir':
 		case 'telemetry':
+		case 'sign-extension-uri':
 			return false;
 		default:
 			return true;
@@ -77,6 +78,7 @@ const isSupportedForPipe = (optionId: keyof RemoteParsedArgs) => {
 		case 'verbose':
 		case 'remote':
 		case 'locate-shell-integration-path':
+		case 'sign-extension-uri':
 			return true;
 		default:
 			return false;
@@ -300,6 +302,18 @@ export async function main(desc: ProductDescription, args: string[]): Promise<vo
 			}
 		}
 	} else {
+		if (parsedArgs['sign-extension-uri']) {
+			await sendToPipe({
+				type: 'signExtensionUri',
+				uri: parsedArgs['sign-extension-uri']
+			}, verbose).then((res: string) => {
+				console.log(res);
+			}).catch(e => {
+				console.error('Error when signing the extension URI:', e);
+			});
+			return;
+		}
+
 		if (parsedArgs.status) {
 			await sendToPipe({
 				type: 'status'

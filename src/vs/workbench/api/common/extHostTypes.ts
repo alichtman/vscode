@@ -2736,6 +2736,11 @@ export enum ExtensionMode {
 	Test = 3,
 }
 
+export enum UriHandlerUnsupportedPlatformPolicy {
+	Reject = 'reject',
+	Allow = 'allow',
+}
+
 export enum ExtensionRuntime {
 	/**
 	 * The extension is running in a NodeJS extension host. Runtime access to NodeJS APIs is available.

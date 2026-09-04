@@ -44,7 +44,12 @@ export interface ExtensionManagementPipeArgs {
 	force?: boolean;
 }
 
-export type PipeCommand = OpenCommandPipeArgs | StatusPipeArgs | OpenExternalCommandPipeArgs | ExtensionManagementPipeArgs;
+export interface SignExtensionUriPipeArgs {
+	type: 'signExtensionUri';
+	uri: string;
+}
+
+export type PipeCommand = OpenCommandPipeArgs | StatusPipeArgs | OpenExternalCommandPipeArgs | ExtensionManagementPipeArgs | SignExtensionUriPipeArgs;
 
 export interface ICommandsExecuter {
 	executeCommand<T>(id: string, ...args: unknown[]): Promise<T>;
@@ -58,6 +63,7 @@ export class CLIServerBase {
 		private readonly _commands: ICommandsExecuter,
 		private readonly logService: ILogService,
 		private readonly _ipcHandlePath: string,
+		private readonly _signExtensionUri?: (uri: string) => Promise<string>,
 	) {
 		this.setup();
 	}
@@ -109,6 +115,12 @@ export class CLIServerBase {
 						break;
 					case 'extensionManagement':
 						returnObj = await this.manageExtensions(data);
+						break;
+					case 'signExtensionUri':
+						if (!this._signExtensionUri) {
+							throw new Error('Signing extension URIs is not supported by this CLI server.');
+						}
+						returnObj = await this._signExtensionUri(data.uri);
 						break;
 					default:
 						sendResponse(404, `Unknown message type: ${data.type}`);
